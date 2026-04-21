@@ -1,0 +1,6 @@
+{
+  "name": "SubTranscript Aligner",
+  "description": "Align docx transcripts with SRT subtitles while maintaining original time stamps using AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
