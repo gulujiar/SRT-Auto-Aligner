@@ -15,7 +15,9 @@ import {
   FileCode,
   Table as TableIcon,
   ChevronRight,
-  Split
+  Split,
+  Settings,
+  Brain
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import mammoth from 'mammoth';
@@ -75,6 +77,10 @@ export default function App() {
   const [unusedFragments, setUnusedFragments] = useState<string[]>([]);
   const [rawAiResponse, setRawAiResponse] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+
+  const [deepSeekKey, setDeepSeekKey] = useState<string>(() => localStorage.getItem('deepseek_api_key') || '');
+  const [showSettings, setShowSettings] = useState(false);
+  const [tempKey, setTempKey] = useState(deepSeekKey);
 
   const fileInputSrt = useRef<HTMLInputElement>(null);
   const fileInputDocx = useRef<HTMLInputElement>(null);
@@ -145,12 +151,8 @@ export default function App() {
     setRawAiResponse('');
     setError(null);
 
-    try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      // We send pairs of ID and Content to keep context small, and the full docx text.
-      const srtSummary = srtEntries.map(e => `[ID:${e.id}] ${e.content}`).join('\n');
-      
-      const prompt = `你是一位专业的字幕对齐专家。
+    const srtSummary = srtEntries.map(e => `[ID:${e.id}] ${e.content}`).join('\n');
+    const prompt = `你是一位专业的字幕对齐专家。
 目标：将 [新文稿docx] 的内容填充到 [原始SRT字幕] 对应的序号中。
 
 输入：
@@ -173,36 +175,68 @@ ${srtSummary}
 ${docxText}
 `;
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-pro-preview",
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              results: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    content: { type: Type.STRING }
-                  },
-                  required: ["id", "content"]
+    try {
+      let responseText = '';
+
+      if (deepSeekKey) {
+        // Use DeepSeek API
+        const response = await fetch('https://api.deepseek.com/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${deepSeekKey}`
+          },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [
+              { role: 'system', content: 'You are a professional subtitle alignment expert.' },
+              { role: 'user', content: prompt }
+            ],
+            response_format: { type: 'json_object' }
+          })
+        });
+
+        if (!response.ok) {
+          const errData = await response.json();
+          throw new Error(errData?.error?.message || 'DeepSeek API error');
+        }
+
+        const data = await response.json();
+        responseText = data.choices[0].message.content;
+      } else {
+        // Use Gemini API
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+        const response = await ai.models.generateContent({
+          model: "gemini-3.1-pro-preview",
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                results: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      id: { type: Type.STRING },
+                      content: { type: Type.STRING }
+                    },
+                    required: ["id", "content"]
+                  }
+                },
+                unusedFragments: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING }
                 }
               },
-              unusedFragments: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING }
-              }
-            },
-            required: ["results", "unusedFragments"]
+              required: ["results", "unusedFragments"]
+            }
           }
-        }
-      });
+        });
+        responseText = response.text || '{"results":[], "unusedFragments":[]}';
+      }
 
-      const responseText = response.text || '{"results":[], "unusedFragments":[]}';
       setRawAiResponse(responseText);
       const parsed: AlignmentResponse = JSON.parse(responseText);
       setResults(parsed.results);
@@ -213,6 +247,12 @@ ${docxText}
     } finally {
       setIsLoading(false);
     }
+  };
+
+  const saveDeepSeekKey = () => {
+    setDeepSeekKey(tempKey);
+    localStorage.setItem('deepseek_api_key', tempKey);
+    setShowSettings(false);
   };
 
   const downloadSrt = () => {
@@ -293,6 +333,66 @@ ${docxText}
         </div>
         
         <div className="flex items-center gap-3">
+          <div className="relative">
+             <button 
+                onClick={() => setShowSettings(!showSettings)}
+                className={`p-2 rounded-md transition-all ${deepSeekKey ? 'bg-indigo-50 text-indigo-600 border border-indigo-100' : 'text-slate-500 hover:bg-slate-100'}`}
+                title="DeepSeek API 设置"
+              >
+                <Settings className="w-5 h-5" />
+              </button>
+
+              <AnimatePresence>
+                {showSettings && (
+                  <motion.div 
+                    initial={{ opacity: 0, scale: 0.95, y: 10 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.95, y: 10 }}
+                    className="absolute right-0 mt-2 w-72 bg-white border border-brand-border rounded-lg shadow-xl z-[100] p-4"
+                  >
+                    <h4 className="text-[13px] font-bold mb-3 flex items-center gap-2">
+                       <Brain className="w-4 h-4 text-indigo-500" />
+                       DeepSeek 设置
+                    </h4>
+                    <p className="text-[11px] text-slate-500 mb-4 leading-relaxed">
+                      设置 DeepSeek API Key 后，系统将自动切换为使用 DeepSeek 引擎进行对齐（更加精准且支持长文本）。
+                    </p>
+                    <div className="space-y-3">
+                       <div>
+                         <label className="block text-[11px] font-bold text-slate-600 mb-1">API KEY</label>
+                         <input 
+                           type="password" 
+                           value={tempKey}
+                           onChange={(e) => setTempKey(e.target.value)}
+                           placeholder="sk-..."
+                           className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded text-[12px] focus:ring-1 focus:ring-indigo-500 outline-none"
+                         />
+                       </div>
+                       <div className="flex gap-2 pt-2">
+                         <button 
+                           onClick={saveDeepSeekKey}
+                           className="flex-1 px-3 py-2 bg-indigo-600 text-white rounded text-[12px] font-medium hover:bg-indigo-700 transition-colors"
+                         >
+                           保存并启用
+                         </button>
+                         <button 
+                           onClick={() => {
+                             setTempKey('');
+                             setDeepSeekKey('');
+                             localStorage.removeItem('deepseek_api_key');
+                             setShowSettings(false);
+                           }}
+                           className="px-3 py-2 bg-slate-100 text-slate-600 rounded text-[12px] font-medium hover:bg-slate-200 transition-colors"
+                         >
+                           清空
+                         </button>
+                       </div>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+          </div>
+
           {(srtEntries.length > 0 || docxText) && (
              <button 
               onClick={() => {
@@ -492,8 +592,8 @@ ${docxText}
             </div>
             <div className="p-4 border-t border-brand-border text-[11px] text-brand-secondary bg-slate-50">
               <div className="flex justify-between mb-2">
-                <span>处理引擎: Gemini 3.1 Pro</span>
-                <span>智能对齐</span>
+                <span>处理引擎: {deepSeekKey ? 'DeepSeek-Chat' : 'Gemini 3.1 Pro'}</span>
+                <span>{deepSeekKey ? '深度对齐' : '智能对齐'}</span>
               </div>
               <div className="w-full h-1 bg-slate-200 rounded-full overflow-hidden">
                  {isLoading && (
