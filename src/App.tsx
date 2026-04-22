@@ -79,8 +79,21 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
 
   const [deepSeekKey, setDeepSeekKey] = useState<string>(() => localStorage.getItem('deepseek_api_key') || '');
+  const [volcKey, setVolcKey] = useState<string>(() => localStorage.getItem('volc_api_key') || '');
+  const [volcModel, setVolcModel] = useState<string>(() => localStorage.getItem('volc_model_id') || 'ark-code-latest');
+  const [volcBaseUrl, setVolcBaseUrl] = useState<string>(() => localStorage.getItem('volc_base_url') || 'https://ark.cn-beijing.volces.com/api/coding/v3');
+  const [activeProvider, setActiveProvider] = useState<'gemini' | 'deepseek' | 'volc'>(() => {
+    const stored = localStorage.getItem('active_provider');
+    if (stored === 'deepseek' || stored === 'volc') return stored;
+    return 'gemini';
+  });
+
   const [showSettings, setShowSettings] = useState(false);
-  const [tempKey, setTempKey] = useState(deepSeekKey);
+  const [tempDeepSeekKey, setTempDeepSeekKey] = useState(deepSeekKey);
+  const [tempVolcKey, setTempVolcKey] = useState(volcKey);
+  const [tempVolcModel, setTempVolcModel] = useState(volcModel);
+  const [tempVolcBaseUrl, setTempVolcBaseUrl] = useState(volcBaseUrl);
+  const [settingsTab, setSettingsTab] = useState<'deepseek' | 'volc'>('deepseek');
 
   const fileInputSrt = useRef<HTMLInputElement>(null);
   const fileInputDocx = useRef<HTMLInputElement>(null);
@@ -178,31 +191,87 @@ ${docxText}
     try {
       let responseText = '';
 
-      if (deepSeekKey) {
-        // Use DeepSeek API
-        const response = await fetch('https://api.deepseek.com/chat/completions', {
+      if (activeProvider === 'deepseek' && deepSeekKey) {
+        // Use Proxy for DeepSeek API
+        const response = await fetch('/api/proxy', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${deepSeekKey}`
           },
           body: JSON.stringify({
-            model: 'deepseek-chat',
-            messages: [
-              { role: 'system', content: 'You are a professional subtitle alignment expert.' },
-              { role: 'user', content: prompt }
-            ],
-            response_format: { type: 'json_object' }
+            url: 'https://api.deepseek.com/chat/completions',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${deepSeekKey}`
+            },
+            body: {
+              model: 'deepseek-chat',
+              messages: [
+                { role: 'system', content: 'You are a professional subtitle alignment expert. You always return full, valid JSON. If the content is too long, prioritize essential results.' },
+                { role: 'user', content: prompt }
+              ],
+              response_format: { type: 'json_object' },
+              max_tokens: 8192
+            }
           })
         });
 
         if (!response.ok) {
           const errData = await response.json();
-          throw new Error(errData?.error?.message || 'DeepSeek API error');
+          throw new Error(errData?.error || errData?.details || 'DeepSeek API error');
         }
 
         const data = await response.json();
         responseText = data.choices[0].message.content;
+      } else if (activeProvider === 'volc' && volcKey) {
+        // Use Proxy for Volcano Engine (Ark) API
+        const baseUrl = volcBaseUrl.endsWith('/') ? volcBaseUrl.slice(0, -1) : volcBaseUrl;
+        
+        // Some Ark models do not support response_format: { type: 'json_object' }
+        // We will pass it but wrap in a try-catch for the specific error if it happens
+        // Note: For 'coding' models, it's safer to rely on the prompt for JSON
+        const response = await fetch('/api/proxy', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            url: `${baseUrl}/chat/completions`,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${volcKey}`
+            },
+            body: {
+              model: volcModel,
+              messages: [
+                { role: 'system', content: 'You are a professional subtitle alignment expert. You must ALWAYS return a valid JSON object.' },
+                { role: 'user', content: prompt }
+              ],
+              // Remove response_format for Volc as it's often not supported on coding models
+              // and can cause 400 errors.
+              temperature: 0.1,
+              max_tokens: 8192
+            }
+          })
+        });
+
+        if (!response.ok) {
+          const errData = await response.json();
+          const detail = errData?.error?.message || errData?.error || errData?.details || '火山引擎 API 错误';
+          throw new Error(detail);
+        }
+
+        const data = await response.json();
+        responseText = data.choices[0].message.content;
+        
+        // Sanitize responseText if it contains markdown code blocks
+        if (responseText.includes('```json')) {
+          responseText = responseText.split('```json')[1].split('```')[0].trim();
+        } else if (responseText.includes('```')) {
+          responseText = responseText.split('```')[1].split('```')[0].trim();
+        }
       } else {
         // Use Gemini API
         const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -211,6 +280,7 @@ ${docxText}
           contents: prompt,
           config: {
             responseMimeType: "application/json",
+            maxOutputTokens: 8192,
             responseSchema: {
               type: Type.OBJECT,
               properties: {
@@ -238,9 +308,27 @@ ${docxText}
       }
 
       setRawAiResponse(responseText);
-      const parsed: AlignmentResponse = JSON.parse(responseText);
-      setResults(parsed.results);
-      setUnusedFragments(parsed.unusedFragments);
+      
+      let parsed: AlignmentResponse;
+      try {
+        parsed = JSON.parse(responseText);
+      } catch (jsonErr) {
+        console.error('JSON Parse Error:', jsonErr);
+        // Attempt to fix simple truncation (experimental)
+        if (responseText.trim().endsWith(',') || responseText.trim().endsWith('}')) {
+           throw new Error('AI 返回内容不完整（可能触发了 Token 限制）。请尝试分段处理文稿，或换用支持更长上下文的模型。');
+        }
+        throw new Error('解析 AI 回复失败，格式不正确或被截断。');
+      }
+
+      // Normalize IDs to strings to match SubtitleEntry.id
+      const normalizedResults = (parsed.results || []).map(r => ({
+        ...r,
+        id: String(r.id)
+      }));
+
+      setResults(normalizedResults);
+      setUnusedFragments(parsed.unusedFragments || []);
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'AI alignment failed');
@@ -249,10 +337,34 @@ ${docxText}
     }
   };
 
-  const saveDeepSeekKey = () => {
-    setDeepSeekKey(tempKey);
-    localStorage.setItem('deepseek_api_key', tempKey);
+  const saveSettings = () => {
+    // DeepSeek
+    setDeepSeekKey(tempDeepSeekKey);
+    localStorage.setItem('deepseek_api_key', tempDeepSeekKey);
+
+    // Volc
+    setVolcKey(tempVolcKey);
+    setVolcModel(tempVolcModel);
+    setVolcBaseUrl(tempVolcBaseUrl);
+    localStorage.setItem('volc_api_key', tempVolcKey);
+    localStorage.setItem('volc_model_id', tempVolcModel);
+    localStorage.setItem('volc_base_url', tempVolcBaseUrl);
+
+    // Logic to auto-switch provider if key is newly set and others aren't
+    if (tempDeepSeekKey && !deepSeekKey) {
+      setActiveProvider('deepseek');
+      localStorage.setItem('active_provider', 'deepseek');
+    } else if (tempVolcKey && !volcKey) {
+      setActiveProvider('volc');
+      localStorage.setItem('active_provider', 'volc');
+    }
+
     setShowSettings(false);
+  };
+
+  const switchProvider = (provider: 'gemini' | 'deepseek' | 'volc') => {
+    setActiveProvider(provider);
+    localStorage.setItem('active_provider', provider);
   };
 
   const downloadSrt = () => {
@@ -336,8 +448,8 @@ ${docxText}
           <div className="relative">
              <button 
                 onClick={() => setShowSettings(!showSettings)}
-                className={`p-2 rounded-md transition-all ${deepSeekKey ? 'bg-indigo-50 text-indigo-600 border border-indigo-100' : 'text-slate-500 hover:bg-slate-100'}`}
-                title="DeepSeek API 设置"
+                className={`p-2 rounded-md transition-all ${(deepSeekKey || volcKey) ? 'bg-indigo-50 text-indigo-600 border border-indigo-100' : 'text-slate-500 hover:bg-slate-100'}`}
+                title="AI 引擎设置"
               >
                 <Settings className="w-5 h-5" />
               </button>
@@ -348,44 +460,133 @@ ${docxText}
                     initial={{ opacity: 0, scale: 0.95, y: 10 }}
                     animate={{ opacity: 1, scale: 1, y: 0 }}
                     exit={{ opacity: 0, scale: 0.95, y: 10 }}
-                    className="absolute right-0 mt-2 w-72 bg-white border border-brand-border rounded-lg shadow-xl z-[100] p-4"
+                    className="absolute right-0 mt-2 w-80 bg-white border border-brand-border rounded-lg shadow-xl z-[100] overflow-hidden"
                   >
-                    <h4 className="text-[13px] font-bold mb-3 flex items-center gap-2">
-                       <Brain className="w-4 h-4 text-indigo-500" />
-                       DeepSeek 设置
-                    </h4>
-                    <p className="text-[11px] text-slate-500 mb-4 leading-relaxed">
-                      设置 DeepSeek API Key 后，系统将自动切换为使用 DeepSeek 引擎进行对齐（更加精准且支持长文本）。
-                    </p>
-                    <div className="space-y-3">
-                       <div>
-                         <label className="block text-[11px] font-bold text-slate-600 mb-1">API KEY</label>
-                         <input 
-                           type="password" 
-                           value={tempKey}
-                           onChange={(e) => setTempKey(e.target.value)}
-                           placeholder="sk-..."
-                           className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded text-[12px] focus:ring-1 focus:ring-indigo-500 outline-none"
-                         />
-                       </div>
-                       <div className="flex gap-2 pt-2">
-                         <button 
-                           onClick={saveDeepSeekKey}
-                           className="flex-1 px-3 py-2 bg-indigo-600 text-white rounded text-[12px] font-medium hover:bg-indigo-700 transition-colors"
-                         >
-                           保存并启用
-                         </button>
-                         <button 
-                           onClick={() => {
-                             setTempKey('');
-                             setDeepSeekKey('');
-                             localStorage.removeItem('deepseek_api_key');
-                             setShowSettings(false);
-                           }}
-                           className="px-3 py-2 bg-slate-100 text-slate-600 rounded text-[12px] font-medium hover:bg-slate-200 transition-colors"
-                         >
-                           清空
-                         </button>
+                    <div className="px-4 py-3 bg-brand-panel-header border-b border-brand-border flex items-center justify-between">
+                      <h4 className="text-[13px] font-bold flex items-center gap-2">
+                         <Settings className="w-4 h-4 text-slate-500" />
+                         AI 引擎配置
+                      </h4>
+                    </div>
+
+                    <div className="flex border-b border-brand-border">
+                       <button 
+                         onClick={() => setSettingsTab('deepseek')}
+                         className={`flex-1 py-2 text-[11px] font-bold transition-colors ${settingsTab === 'deepseek' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-slate-500 hover:bg-slate-50'}`}
+                       >
+                         DeepSeek
+                       </button>
+                       <button 
+                         onClick={() => setSettingsTab('volc')}
+                         className={`flex-1 py-2 text-[11px] font-bold transition-colors ${settingsTab === 'volc' ? 'text-orange-600 border-b-2 border-orange-600' : 'text-slate-500 hover:bg-slate-50'}`}
+                       >
+                         火山引擎 (Ark)
+                       </button>
+                    </div>
+
+                    <div className="p-4 space-y-4">
+                       {settingsTab === 'deepseek' ? (
+                         <div className="space-y-3">
+                            <p className="text-[11px] text-slate-500 leading-relaxed italic">
+                              DeepSeek 引擎在语义理解和长文本分析上具有极高性能。
+                            </p>
+                            <div>
+                              <label className="block text-[11px] font-bold text-slate-600 mb-1">DeepSeek API KEY</label>
+                              <input 
+                                type="password" 
+                                value={tempDeepSeekKey}
+                                onChange={(e) => setTempDeepSeekKey(e.target.value)}
+                                placeholder="sk-..."
+                                className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded text-[12px] focus:ring-1 focus:ring-indigo-500 outline-none"
+                              />
+                            </div>
+                            <button 
+                              onClick={() => switchProvider('deepseek')}
+                              disabled={!tempDeepSeekKey && !deepSeekKey}
+                              className={`w-full py-2 rounded text-[11px] font-bold transition-all ${activeProvider === 'deepseek' ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                            >
+                              {activeProvider === 'deepseek' ? '当前正在使用' : '切换为此引擎'}
+                            </button>
+                         </div>
+                       ) : (
+                         <div className="space-y-3">
+                            <p className="text-[11px] text-slate-500 leading-relaxed italic">
+                              火山引擎 (方舟) 提供稳定的企业级大模型服务。
+                              <br/>
+                              <span className="text-orange-600 font-bold">提示：Coding 模式支持直接使用模型名称</span>
+                            </p>
+                            <div>
+                               <label className="block text-[11px] font-bold text-slate-600 mb-1">Base URL</label>
+                               <input 
+                                 type="text" 
+                                 value={tempVolcBaseUrl}
+                                 onChange={(e) => setTempVolcBaseUrl(e.target.value)}
+                                 placeholder="https://ark.cn-beijing.volces.com/api/coding/v3"
+                                 className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded text-[12px] focus:ring-1 focus:ring-orange-500 outline-none"
+                               />
+                            </div>
+                            <div>
+                               <label className="block text-[11px] font-bold text-slate-600 mb-1">Ark API KEY</label>
+                               <input 
+                                 type="password" 
+                                 value={tempVolcKey}
+                                 onChange={(e) => setTempVolcKey(e.target.value)}
+                                 placeholder="API Key"
+                                 className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded text-[12px] focus:ring-1 focus:ring-orange-500 outline-none"
+                               />
+                            </div>
+                            <div>
+                               <label className="block text-[11px] font-bold text-slate-600 mb-1">模型名称 (Model ID)</label>
+                               <input 
+                                 type="text" 
+                                 value={tempVolcModel}
+                                 onChange={(e) => setTempVolcModel(e.target.value)}
+                                 placeholder="例如 ark-code-latest"
+                                 className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded text-[12px] focus:ring-1 focus:ring-orange-500 outline-none"
+                               />
+                            </div>
+                            <button 
+                              onClick={() => switchProvider('volc')}
+                              disabled={!tempVolcKey && !volcKey}
+                              className={`w-full py-2 rounded text-[11px] font-bold transition-all ${activeProvider === 'volc' ? 'bg-orange-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                            >
+                              {activeProvider === 'volc' ? '当前正在使用' : '切换为此引擎'}
+                            </button>
+                         </div>
+                       )}
+
+                       <div className="pt-2 border-t border-brand-border flex flex-col gap-2">
+                          <button 
+                            onClick={() => switchProvider('gemini')}
+                            className={`w-full py-2 rounded text-[11px] font-bold transition-all ${activeProvider === 'gemini' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+                          >
+                            {activeProvider === 'gemini' ? '当前使用 Gemini (默认)' : '切换回 Gemini (默认)'}
+                          </button>
+                          
+                          <div className="flex gap-2">
+                            <button 
+                              onClick={saveSettings}
+                              className="flex-1 px-3 py-2 bg-slate-800 text-white rounded text-[12px] font-medium hover:bg-slate-900 transition-colors"
+                            >
+                              保存所有更改
+                            </button>
+                            <button 
+                              onClick={() => {
+                                setTempDeepSeekKey('');
+                                setDeepSeekKey('');
+                                setTempVolcKey('');
+                                setVolcKey('');
+                                localStorage.removeItem('deepseek_api_key');
+                                localStorage.removeItem('volc_api_key');
+                                setActiveProvider('gemini');
+                                localStorage.setItem('active_provider', 'gemini');
+                                setShowSettings(false);
+                              }}
+                              className="px-3 py-2 bg-red-50 text-red-600 rounded text-[12px] font-medium hover:bg-red-100 transition-colors"
+                            >
+                              清空
+                            </button>
+                          </div>
                        </div>
                     </div>
                   </motion.div>
@@ -405,6 +606,15 @@ ${docxText}
               className="px-4 py-2 border border-slate-300 bg-transparent text-[13px] rounded-md font-medium text-slate-700 hover:bg-slate-50 transition-colors"
             >
               重新上传
+            </button>
+          )}
+          {results.length > 0 && !isLoading && (
+            <button 
+              onClick={handleAlign}
+              className="px-4 py-2 bg-slate-100 text-slate-700 text-[13px] rounded-md font-medium hover:bg-slate-200 transition-all flex items-center gap-2 border border-slate-200"
+            >
+              <RefreshCw className="w-3 h-3" />
+              重新对齐
             </button>
           )}
           {results.length > 0 ? (
@@ -592,8 +802,12 @@ ${docxText}
             </div>
             <div className="p-4 border-t border-brand-border text-[11px] text-brand-secondary bg-slate-50">
               <div className="flex justify-between mb-2">
-                <span>处理引擎: {deepSeekKey ? 'DeepSeek-Chat' : 'Gemini 3.1 Pro'}</span>
-                <span>{deepSeekKey ? '深度对齐' : '智能对齐'}</span>
+                <span>处理引擎: {
+                  activeProvider === 'deepseek' ? 'DeepSeek-Chat' : 
+                  activeProvider === 'volc' ? '火山引擎 (Ark)' : 
+                  'Gemini 3.1 Pro'
+                }</span>
+                <span>{activeProvider !== 'gemini' ? '深度对齐' : '智能对齐'}</span>
               </div>
               <div className="w-full h-1 bg-slate-200 rounded-full overflow-hidden">
                  {isLoading && (
@@ -623,9 +837,20 @@ ${docxText}
           >
             <AlertCircle className="w-5 h-5" />
             <span className="text-sm font-semibold">{error}</span>
-            <button onClick={() => setError(null)} className="ml-2 bg-white/20 hover:bg-white/30 p-1 rounded">
-              <RefreshCw className="w-3 h-3" />
-            </button>
+            <div className="flex items-center gap-2 ml-4">
+              <button 
+                onClick={() => {
+                  setError(null);
+                  handleAlign();
+                }} 
+                className="bg-white text-red-600 px-3 py-1 rounded text-xs font-bold hover:bg-white/90 transition-colors"
+              >
+                重试
+              </button>
+              <button onClick={() => setError(null)} className="bg-white/20 hover:bg-white/30 p-1.5 rounded transition-colors">
+                <Settings className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
